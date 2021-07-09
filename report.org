@@ -1,0 +1,504 @@
+#+TITLE: Preliminary Tinlake Audit Report:
+#+SUBTITLE: Lender and MKR Adapter
+#+DATE: 21.06.2021
+#+AUTHOR: dapp.org
+#+EMAIL: fv@dapp.org
+#+OPTIONS: ':nil *:t -:t ::t <:t H:3 \n:nil ^:t arch:headline
+#+OPTIONS: author:t c:nil creator:comment d:(not "LOGBOOK") date:t
+#+OPTIONS: e:t email:t f:t inline:t num:t p:nil pri:nil stat:t
+#+OPTIONS: tags:t tasks:t tex:t timestamp:t toc:3 todo:t |:t
+#+OPTIONS: num:0 html-postamble:nil title:nil
+#+HTML_HEAD_EXTRA: <style> body { line-height: 1.6; font-size: 18px; padding: 0 10px;text-align: justify;text-justify: inter-word; margin: 60px auto; max-width: 800px; } h2,h2,h3{line-height:1.2} a:link { color: #0466c8; } a:visited { color: #0466c8; } code, .code { font-family: Consolas, "Liberation Mono", Menlo, Courier, monospace; font-size: 1.125rem; line-height: 1.6; padding: 0; padding-top: 0; padding-bottom: 0; margin: 0; font-size: 85%; background-color: rgba(0,0,0,0.04); border-radius: 3px; } h2 { border-bottom: 3px solid #444; } h3 { text-decoration: underline; } h4 { font-style: italic } table { width: 100% } .src,.example {background: #292929; color: #fafafa; font-size: 16px; padding: 0; padding: 10px;} img { width: 100% } blockquote {margin: 20px; padding: 20px; border-left: 2px solid; font-style: italic }</style>
+#+DESCRIPTION:
+#+EXCLUDE_TAGS: noexport
+#+KEYWORDS:
+#+LANGUAGE: en
+#+SELECT_TAGS: export
+#+LATEX_HEADER: \usepackage[a4paper]{anysize}
+#+LATEX_HEADER: \usepackage[margin=2cm]{geometry}
+
+#+BEGIN_SRC emacs-lisp :exports none :results none
+  (setq org-html-preamble-format
+  '(("en"
+     "<h1 class=\"title\">%t</h1>
+    <h1 class=\"subtitle\">%s</h1>
+      <p class=\"subtitle\"><i>%a</i></p>
+      <p class=\"subtitle\">%e</p>
+      <p class=\"subtitle\">%d </p><br></br>")))
+#+END_SRC
+
+* Summary
+
+From May 31st to June 6 2021, a team of four engineers spent a total of 8 person weeks reviewing the lender modules and the MakerDAO integration for Centrifuge's Tinlake system.
+
+The phase 1 review was carried out against the following git commits:
+
+- [[https://github.com/centrifuge/tinlake/tree/35bccfbc209562095bff3f601541aa2b6ae664fb][centrifuge/tinlake]] at ~35bccfbc209562095bff3f601541aa2b6ae664fb~
+- [[https://github.com/centrifuge/tinlake-maker-lib/tree/ccd49b6def03537483dfe8695d94ee0652884ff7][centrifuge/tinlake-maker-lib]] at ~ccd49b6def03537483dfe8695d94ee0652884ff7~
+
+The audit engagement is split into two phases. The next phase will cover the borrower modules over an additional 8 person week period.
+
+** Team
+
+The review was carried out by the following members of the [[http://dapp.org][dapp.org]] collective:
+
+- David Terry
+- Denis Erfurt
+- Jenny Pollack
+- Martin Lundfall
+
+** Tests
+
+To facilitate the analysis, the team implemented a suite of integration,
+property tests and invariant tests using the [[https://github.com/dapphub/dapptools][dapptools]] toolbox, which can be found at
+[[https://github.com/dapp-org/tinlake-tests/]].
+This includes demonstrations of most of the vulnerabilities described in this document.
+
+** Changelog
+
+A revision history for this document can be found [[https://github.com/dapp-org/tinlake-report][here]]
+
+* System Overview
+
+Tinlake is a system that allows lenders to provide credit to holders of non
+fungible assets. The assets are represented on chain as ERC-721
+tokens. Borrowers lock these assets in tinlake, and can borrow currency up to
+some configurable percentage of the assessed value of their asset.
+
+Different classes of assets are held in different pools, with "asset
+originators" having the power to approve individual assets for borrowing in a
+pool, and to assess their value. Each pool is a complete new deployment of the
+contracts.
+
+Lenders must undergo KYC, and once approved by Tinlake governance, can invest in
+either the junior or senior tranche. If loans default and losses occur, they
+will be taken from the junior tranche before the senior tranche. The senior
+tranche has a fixed interest rate, whereas the junior tranche receives a
+variable (and potentially higher) rate of return.  In return for providing
+currency to borrowers, lenders receive a fungible token (=DROP= for the senior
+tranche, and =TIN= for the junior tranche), this token can be exchanged for
+currency at a price determined by the pool contracts.
+
+In order to provide some resistance against transaction reordering attacks and to
+prevent races, the lending side of the system makes use of an epoch mechanism.
+Lenders supply currency, or redeem their DROP / TIN for currency by first
+submitting an order to the pool, and then waiting for the epoch to close. Once
+the epoch is closed, the orders are executed in full if possible, or partially
+if a full execution would violate certain pool constraints (e.g. the ratio of
+junior to senior investors). Due to the computational complexity of calculating
+the partial order fulfillment, the calculation is made off chain and the smart
+contracts validate the results.
+
+The system can additionally integrate with external credit providers
+(e.g. MakerDAO), allowing holders of NFTs to access credit from existing DeFi
+lending institutions (that are generally designed with fungible assets in mind).
+
+In pools that are integrated with MakerDAO, Maker acts essentially as a large
+senior investor, holding a DROP position as collateral to enable dai minting to
+fund loans in the tinlake system. However, the net result of the DROP position
+and the dai loan of the Maker CDP is redirected to flow to TIN holders, as they
+bear the risk in this setting. The Maker integration can be seen as a way to
+leverage the performance of the Tinlake system, allowing for increased capital
+efficiency, while increasing TIN risk.
+
+More in depth documentation of the intended functioning of the tinlake system
+can be found at https://developer.centrifuge.io/. More information about the
+maker adapter can be found in the assessment by the maker developers:
+https://forum.makerdao.com/t/ns2drp-ns-drop-mip22-token-smart-contract-domain-team-assessment/5517
+
+* Findings
+
+Our findings are separated into three sections:
+
+- *[[Bugs]]*: issues that impact the security or correctness of the system
+- *[[Improvements]]*: changes that could improve the clarity, functionality, or efficiency of the system, but that do not impact security or correctness
+- *[[Notes and Miscellanea]]*: points of interest that do not merit an explicit recommendation for change
+
+** Bugs
+
+| *Finding*                                                                | *Severity* | *Likelihood* | *Addressed*         |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B01. =reserve.sol= accounting can be manipulated by dai transfers        | High       | High         | [[https://github.com/centrifuge/tinlake/pull/579/commits/3c8db8ebaa12f5c0471f1aa3a8be6c5c88791d72][=3c8db8e=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B02. =clerk.stabilityFee= does not take =jug.base= into account          | High       | Low          | [[https://github.com/centrifuge/tinlake/pull/579/commits/1c91385ee79eebdfd138cd69307722420b0b2f98][=1c91385=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B03. =clerk.sol= rounding error can lead to DROP price of 0              | High       | Low          | [[https://github.com/centrifuge/tinlake/pull/579/commits/1d54213f06baa373258a5a0bc69be04c8aa442e8][=1d54213=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B04. =assessor.sol= senior ratio can exceed ONE                          | Medium     | Low   | [[https://github.com/centrifuge/tinlake/pull/579/commits/1d54213f06baa373258a5a0bc69be04c8aa442e8][=1d54213=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B05. Double counting assets between =shelf.borrow= and =shelf.withdraw=  | Medium     | High         | [[https://github.com/centrifuge/tinlake/pull/579/commits/c633f7e72e122f39fcdb047a50295ddc931906d1][=c633f7e=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B06. Senior interest for the first loan in a pool can be applied twice   | Medium     | High         | [[https://github.com/centrifuge/tinlake/pull/579/commits/ddee95f71d191d9173c6f11950d00437999ee053][=ddee95f=]] [[https://github.com/centrifuge/tinlake/pull/579/commits/695fc127aa3a7474b3ed9aea70ea6c0b77899c6a][=695fc12=]] |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+| B07. Mixed usage of =approximatedNAV= and =currentNAV= in =assessor.sol= | Low        | High         | [[https://github.com/centrifuge/tinlake/pull/579/commits/7cac561ff3242448165368d2bc0d15c2c23c2a8d][=7cac561=]]           |
+|--------------------------------------------------------------------------+------------+--------------+---------------------|
+
+*** B01. =reserve.sol= accounting can be manipulated by dai transfers
+
+In =reserve.sol=, both a local =balance_= variable which is incremented and subtracted
+at deposits and payouts, and the direct =balanceOf(pot)= value are being used in calculations
+involving the maker adapter integration: [[https://github.com/centrifuge/tinlake/blob/35bccfbc209562095bff3f601541aa2b6ae664fb/src/lender/reserve.sol#L118][L118]], [[https://github.com/centrifuge/tinlake/blob/35bccfbc209562095bff3f601541aa2b6ae664fb/src/lender/reserve.sol#L143][L143]].
+If someone were to send at least 1 wei dai to the reserve, =balanceOf(pot)= will be larger than =balance_=,
+which can lead to blocking payouts or deposits from a failing =safeSub= in [[https://github.com/centrifuge/tinlake/blob/35bccfbc209562095bff3f601541aa2b6ae664fb/src/lender/reserve.sol#L134][_payoutAction]], causing a system deadlock.
+
+*** B02. =clerk.stabilityFee= does not take =jug.base= into account
+
+While the maker stability fee is correctly calculated by the following
+expression in =clerk.debt()=:
+
+#+BEGIN_SRC solidity
+rmul(art, rmul(rpow(safeAdd(jug.base(), duty), safeSub(block.timestamp, rho), ONE), rateIdx));
+#+END_SRC
+
+the function =clerk.stabilityFee= fails to take =jug.base()= into account, which can lead
+to an incorrect calculation of the cdp debt in =assessor.remainingCredit=, in the worst case
+reverting a =safeSub=, blocking calls to =assessor.seniorBalance()= and subsequently deadlocks
+epoch execution.
+
+n.b. that in practice, the =jug.base()= variable has always been zero since the deployment of
+multicollateral dai and stability fees have been adjusted on a per ilk basis.
+
+*** B03. =clerk.sol= rounding error can lead to DROP price of 0
+
+When due some rounding error seniorTranche.tokenSupply() is left with dust (e.g. 1 instead of 0),
+the check in =assessor.sol#L167= during =_calcSeniorTokenPrice= is missed and the seniorTokenPrice
+can end up being =0= (in case the pool only has junior investors). This can lead to multiple issues,
+- a division by `0` at `clerk.sol#L231` where the seniorTokenPrice ends up being =0=
+- when a senior investor tries to redeem they will be stuck calling disburse due to another division by zero in `tranche.sol#L167`.
+This scenario only occurs when seniorTokenRatio is allowed to be `0` and the pool only consists out of junior investors.
+
+*** B04. =assessor.sol= senior ratio can exceed ONE
+
+It's taken to account in =reBalance= but the `seniorRatio` is not updated in
+=repaymentUpdate= and so it would be wrong adjusting the senior balance and
+debt. Needs more analysis on the borrower side.
+
+*** B05. Double counting assets of loans between =shelf.borrow= and =shelf.withdraw=
+
+The total assets held by the tinlake system at any point in time is given by
+=reserves + NAV=; idle deposits kept in the reserve and the net asset value of
+all outstanding loans (see https://developer.centrifuge.io/learn/understanding-tinlake/#nav for details).
+
+However, in between the two stages of borrowing, =shelf.borrow= and =shelf.withdraw=, a loan is considered active
+and counted towards the NAV, while the borrowed amount still sits in the =reserve=, effectively being counted twice.
+
+This poses a particular problem for pools with Maker integration, as when additional DROP are minted to provide
+collateral for the CDP, the seniorRatio is adjusted too far down, as assets are overvalued, leaving senior investors
+with too little interest accruing stake in the loan (=seniorBalance= becomes too low).
+
+Luckily, this inaccuracy in the =seniorRatio= only remains until =reserve.balance()= is called,
+which happens at every epoch, so senior investors only miss out on a portion of one epochs interest.
+
+*** B06. Senior interest for the first loan in a pool can be applied twice
+
+The method =assessor.dripSeniorDebt()= applies interest on the =seniorDebt=, i.e. the value of
+of current outstanding loans that are generating interest for DROP holders.
+
+However, the storage variable =lastUpdateSeniorInterest= is only updated
+when =seniorDebt= actually has increased:
+#+BEGIN_SRC solidity
+if (newSeniorDebt > seniorDebt_) {
+    seniorDebt_ = newSeniorDebt;
+    lastUpdateSeniorInterest = block.timestamp;
+}
+#+END_SRC
+which means that the initialization of =seniorDebt= does not update this variable,
+and a retroactive, instantaneous interest is applied since the opening of the pool.
+
+In pools without maker integration, this scenario does not occur since the
+=lastUpdateSeniorInterest= variable is updated in =borrowUpdate= (of which =dripSeniorDebt()=
+is a subcall), but changes to =seniorBalance= as a result of =changeSeniorAsset= will lead
+to too much interest being applied.
+
+*** B07. Mixed usage of =approximatedNAV= and =currentNAV= in =assessor.sol=
+
+The =calcSeniorTokenPrice()= and =calcSeniorTokenPrice()= methods on the
+=Assessor= use different values for the NAV calculation. In
+=calcSeniorTokenPrice()= the approximated NAV is used, in =calcJuniorTokenPrice()=
+the current NAV is used. Callers of these methods in the =Assessor= may receive
+inconsistent results.
+
+=calcJuniorTokenPrice()= is not used within tinlake. =calcSeniorTokenPrice= is
+used by the =Clerk=. The =currentNAV= in the current version of the =navfeed= is
+too expensive to use in this context, so =calcJuniorTokenPrice= should be
+modified to use the approximated NAV.
+
+** Improvements
+
+| *Recommendation*                                                                              | *Implemented* |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I01. General lack of events                                                                   |[[https://github.com/centrifuge/tinlake/pull/579/commits/a8b57d5215eb5efb39ceaa8be454538db1bbaac3][=a8b57d5=]] [[https://github.com/centrifuge/tinlake/pull/579/commits/1706aef04b50c8daa4441c5d27945a463bea7b81][=1706aef=]]              |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I02. Return submissionsPeriod and error code in =closeEpoch()=                                |               |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I03. Use =immutable= wherever possible                                                        |[[https://github.com/centrifuge/tinlake/pull/579/commits/6d2b21c5d26f041b99db4af57164bcca7d764d69][=6d2b21c=]]              |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I04. =tranche.sol=: use address(this) instead of =self= state variable                        |[[https://github.com/centrifuge/tinlake/pull/579/commits/1fb4cf2546c5047e9e3f30c543fc09785b7b680e][=1fb4cf2=]]              |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I05. =tranche.sol=: calcDisburse reverse nesting in while and two if statements               |               |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I06. Argument order of newRestrictedToken in RestrictedTokenFab                               |[[https://github.com/centrifuge/tinlake/pull/579/commits/1c65cc40a98a8cf46b8edacb41ab2893be9dcfc9][=1c65cc4=]]              |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I07. Missing tests for =updateMembers()= in =memberAdmin.t.sol= and =poolAdmin.t.sol=         |[[https://github.com/centrifuge/tinlake/pull/579/commits/607227714aa0160a6d45e6a344fdf8ab5a82f905][=6072277=]]            |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I08. Misleading comments in ~assessor.sol~                                                    |               |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I09. ~reserve.sol~: Rename ~balance_~ to ~totalBalance~                                       |[[https://github.com/centrifuge/tinlake/pull/579/commits/6d2b21c5d26f041b99db4af57164bcca7d764d69][=6d2b21c=]]             |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I10. Use enums for error codes in =coordinator()=                                             |               |
+|-----------------------------------------------------------------------------------------------+---------------|
+| I11. Unused parameters in ~Assessor.calcJuniorTokenPrice~ / ~Assessor.calcSeniorTokenPrice~   |               |
+|-----------------------------------------------------------------------------------------------+---------------|
+
+
+*** I01. General lack of events
+
+Events should be used in places where a general state-change takes place, (e.g. such as
+~file~ or ~rely~ calls) in order to monitor state-changes and make the history queryable.
+
+*** I02. Return submissionsPeriod and error code in =closeEpoch()=
+
+When calling =closeEpoch()= there is no indication of whether the epoch successfully
+executed or went into a submission period. Currently a caller will always need to
+call =submissionsPeriod= afterward. It would be more convenient if this was simply
+returned by the =closeEpoch()= method. In case the epoch cannot be closed immediately,
+it would be good to return the error code to inform the caller what constraint cannot
+be fulfilled.
+
+*** I03. Use =immutable= wherever possible
+
+All state variables which are assigned in the constructor and never changed should be
+marked as ~immutable~. This will save gas by putting them directly in the contract code
+instead of in the storage and make the code more readable.
+
+*** I04. =tranche.sol=: use address(this) instead of =self= state variable
+
+The global variable ~address self~ which is set to ~address(this)~ in the constructor
+and never changed is redundant and more expensive then a simple ~address(this)~ statement.
+It should be replaced.
+
+*** I05. Argument order of newRestrictedToken in RestrictedTokenFab
+
+The argument order for ~RestrictedTokenFab.newRestrictedToken(string name, string symbol)~
+is reversed from the underlying call. It should be reversed in order to prevent confusion
+and comply with the order defined by the ETC20 interface.
+
+*** I06. Missing tests for =updateMembers()= in =memberAdmin.t.sol= and =poolAdmin.t.sol=
+
+[[https://github.com/centrifuge/tinlake/blob/35bccfbc209562095bff3f601541aa2b6ae664fb/src/lender/test/memberAdmin.t.sol#L57][memberAdmin]]
+
+[[https://github.com/centrifuge/tinlake/blob/35bccfbc209562095bff3f601541aa2b6ae664fb/src/lender/test/poolAdmin.t.sol#L159][poolAdmin]]
+
+Both files have =updateMembers()= functions for testing and test names which
+indicate they are being used, but the pluralized version of the tests are in
+fact calling the singular =updateMember()= helpers.
+
+*** I07. Redundant checks / updates in ~assessor.sol~
+
+- setting ~lastUpdateSeniorInterest~ at the end of ~repaymentUpdate~ / ~borrowUpdate~
+- repeated checks in ~dripSeniorDebt~ / ~chargeInterest~ / ~seniorDebt()~
+
+*** I08. Misleading comments in ~assessor.sol~
+
+Both =_calcSeniorTokenPrice= and =_calcJuniorTokenPrice= have comments stating
+that the maker creditline is included in the token price calculations, however
+this is not the case for either method.
+
+*** I09. ~reserve.sol~: Rename ~balance_~ to ~totalBalance~
+
+The ~totalBalance~ method of the ~Reserve~ simply returns the value stored in the
+(public) ~balance_~ storage variable. This method could be auto-generated by
+solidity if ~balance_~ was renamed to ~totalBalance~, resulting in a minor code
+simplification.
+
+*** I10. Use enums for error codes in coordinator.
+
+Using enums instead of just constants improves compile time guarantees and
+readability of the code.
+
+*** I11. Unused parameters in ~Assessor.calcJuniorTokenPrice~ / ~Assessor.calcSeniorTokenPrice~
+
+If either function is being called with two parameters, the second parameter is
+ignored and defaults to ~reserve.totalBalance()~. To prevent confusion, this parameter
+could be removed entirely from the function.
+
+** Notes and Miscellanea
+
+*** N01. Misleading naming in deployer code
+
+The deployer for the borrower module has an interface named [[https://github.com/centrifuge/tinlake/blob/a9af91efba44024ab54d3c776c17590ddfc58fe4/src/borrower/deployer.sol#L16][~NFTFeedLike~]], this
+expects an ~init()~ method to be available. However the actual ~NFTFeed~ has no such
+method, and the interface should instead be renamed to ~NAVFeedLike~ to reflect
+the true intention.
+
+*** N02. Accounting in ~Reserve~ makes potentially unsafe assumptions regarding token semantics
+
+The ~Reserve~ contract is responsible for securing and tracking the amount of
+loanable currency in the system. The reserve's current balance is tracked in a
+cached storage variable (~balance_~) which is updated on each call to ~deposit~ or
+~hardDeposit~. This approach is more gas efficient that checking the balance on
+the token directly (with a call to ~balanceOf~), but does make some assumptions
+about token semantics that may not always hold. As an example, if the ~currency~
+token takes a transfer fee the ~balance_~ variable will be incorrect with respect
+to the actual balance of the reserve.
+
+New ~currency~ tokens should be carefully audited to make sure that they do not
+violate the expectations of the ~Reserve~.
+
+
+* Design Analysis
+
+** Rounding Error
+
+Tinlake contains many locations that can introduce precision loss or numerical
+error into the calculations: any usage of native EVM division, or of the fixed
+point multiplication (=rmul=) and division (=rdiv=) operations. It is the
+opinion of the audit team that insufficient attention has been given to the
+potential for the precision loss introduced by these operations to negatively
+impact the pool.
+
+Instead of a hard failure in cases where numeric errors result in an arithmetic
+underflow (e.g. when attempting to transfer away more tokens than the pool has
+available), tinlake modifies the values in question so that they no longer
+underflow (e.g. via the =safeTotalSub= and =_safeTransfer= methods). Although their
+usage may allow execution to continue in the face of precision loss, they also
+hide the presence of such errors, and allow them to propagate (and potentially
+accumulate or compound), potentially resulting in unexpected or dangerous
+behaviour as the system continues to operate with erroneous information.
+
+Although several issues relating to rounding error were uncovered during the
+course of the audit, time constraints meant that a full analysis of all possible
+sources of numeric error and their potential impact has not been carried out.
+
+The audit teams recommended approach to rounding analysis would be to first
+decide on a set of desirable system properties relating to rounding error
+(e.g. "When executing a redeem order, numerical error should always be in favour
+of the investors remaining in the pool"). Once a comprehensive set of properties
+has been defined, each source of numerical error can be analysed in turn to
+ensure that these properties have been upheld. For an example of such an
+analysis, you can refer to the section on numerical error in the [[https://dapp.org.uk/reports/uniswapv2.html#org662af64][uniswap-v2
+audit report]].
+
+As a final note, the direction of rounding in =rdiv= changes depending on the
+size of the remainder, rounding up for cases where the remainder >= 0.5, and
+down otherwise. While this makes intuitive sense, it may complicate the analysis
+described above, and the development team may wish to consider replacing it with
+a fixed point division routine that has a fixed direction of rounding.
+
+** Epochs and Transaction Ordering
+
+Tinlake makes use of an epoch mechanism to provide resistance against some forms
+of strategic transaction ordering. Without the epoch mechanism, a user with DROP
+in the pool could for example redeem their DROP directly after another user has
+supplied currency to the pool, or submit a supply order to an oversubscribed
+pool directly after another participant has redeemed. This would give
+sophisticated users an advantage, and would likely result in a marketplace for
+the right to sequence supply / redeem transactions in the most advantageous
+positions (e.g. via flashbots), inflating the cost of successful interaction with
+the pool. The epoch mechanism additionally attempts to fairly allocate a portion
+of the desired funds to all participants for epochs where it is impossible to
+fully execute all orders.
+
+As the epoch mechanism is applied to lenders only, borrowers can still gain an
+advantage by sequencing their borrows directly after epoch close in cases where
+there is more demand for loans than available credit.
+
+The fair distribution property can also be gamed for epochs where only a partial
+order fulfillment is possible:
+
+1. In the case that all redeem orders cannot be fulfilled in a given
+   epoch, lenders who wish to redeem only a portion of their position can
+   gain an advantage over "honest" pool participants by submitting a redeem order
+   for a larger amount than that which they actually wish to receive. For pools
+   where lenders have a high confidence in being able to reenter the pool, it is
+   probably a strictly better strategy to simply always submit a redeem order
+   for the full amount, and then resupply in the next epoch.
+1. In the case that all supply orders cannot be fulfilled in a given epoch,
+   lenders who wish to enter a pool can gain an advantage by submitting a supply
+   order with a larger amount that they actually wish to supply.
+
+It is also worth noting that since all participants will have an increasingly
+certain expectation of the results of epoch execution as the epoch proceeds, it
+is always generally advantageous to submit orders as close to epoch close as
+possible.
+
+The above issues could be eliminated by:
+
+- introducing a two stage commit/reveal scheme to the epoch process
+- enforcing commit / reveal & epochs for the borrower interactions
+
+Both of these measures would introduce significant additional overhead to system
+interactions, and the costs may outweigh the benefits.
+
+** Collusion resistance
+
+Being a platform for real world assets, loans in tinlake differ from traditional defi
+platforms in that they do not require on chain collateral but are rather legally
+enforced.
+
+However, in some scenarios it is still possible borrowers to extract value from
+the system while repaying their loans by colluding with investors.
+
+*** DROP & borrower collusion
+
+As there can be multiple asset classes with different risk profiles in a Tinlake
+pool, it is possible to have loans whose interest rates are lower than DROP
+returns. In such settings, asset originators can use this in their favor and
+borrow money and provide senior investments with borrowed funds. As long as the
+system can sustain their DROP yields (from other, higher interest loans), this
+provides a net yield for these actors, in effect extracted from TIN holders in
+the system.
+
+
+*** TIN & borrower collusion
+
+Borrowers can also collude with a portion of the TIN investors to extract value
+from other TIN holders by performing the following scenario:
+
+1. Before borrowing, acquire TIN by supplying an order and wait for the epoch to settle.
+2. Take out a large loan, increasing the NAV of the system, and therefore TIN value.
+3. Cash out TIN position at higher price (requires sufficient funds in the reserve).
+4. Repay loan prematurely, before too much interest has accrued.
+
+This attack is essentially possible since NAV calculations assumes loans
+will be paid back with interest in the future, and not be paid back prematurely.
+
+** Governance Powers
+
+The Tinlake system as currently deployed is operated in a centralized manner,
+with a multisig having the power to make or break arbitrary auth connections
+throughout the system. This gives the multisig significant powers over the
+system, including the ability to take all reserves from the system (either via
+=Tranche.authTransfer=, or via a call to =tranche.mint=, followed by the
+submission of a redeem order).
+
+For pools that have been integrated with MakerDAO, the governance multisig can
+draw dai up to the Maker debt ceiling for that pool by creating and approving a
+fake NFT with a very high value, and then borrowing against this NFT.
+
+It should be noted that there is currently no time delay imposed on governance actions.
+
+Users of and integrators with tinlake should be aware of the risk of and
+potential catastrophic impact of a multisig compromise. The address of the root
+multisig is: [[https://etherscan.io/address/0xf3BceA7494D8f3ac21585CA4b0E52aa175c24C25][0xf3BceA7494D8f3ac21585CA4b0E52aa175c24C25]].
+
+* Contract Map
+
+#+BEGIN_EXPORT html
+<img src=./resources/tinlake_contract_diagram.svg />
+#+END_EXPORT
+
+* Appendix A. Bug Classifications
+
+| *Severity*      |                                                                                                           |
+|---------------+-----------------------------------------------------------------------------------------------------------|
+| /informational/ | The issue does not have direct implications for functionality, but could be relevant for understanding.   |
+| /low/           | The issue has no security implications, but could affect some behaviour in an unexpected way.             |
+| /medium/        | The issue affects some functionality, but does not result in economically significant loss of user funds. |
+| /high/          | The issue can cause loss of user funds.                                                                   |
+|---------------+-----------------------------------------------------------------------------------------------------------|
+| *Likelihood*    |                                                                                                           |
+|---------------+-----------------------------------------------------------------------------------------------------------|
+| /low/           | The system is unlikely to be in a state where the bug would occur or could be made to occur by any party. |
+| /medium/        | It is fairly likely that the issue could occur or be made to occur by some party.                         |
+| /high/          | It is very likely that the issue could occur or could be exploited by some parties.                       |
