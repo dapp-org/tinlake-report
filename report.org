@@ -29,7 +29,7 @@
 
 * Summary
 
-From May 31st to June 6 2021, a team of four engineers spent a total of 8 person weeks reviewing the lender modules and the MakerDAO integration for Centrifuge's Tinlake system.
+From May 31st to June 11th 2021, a team of four engineers spent a total of 8 person weeks reviewing the lender modules and the MakerDAO integration for Centrifuge's Tinlake system.
 
 The phase 1 review was carried out against the following git commits:
 
